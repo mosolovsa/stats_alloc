@@ -37,11 +37,10 @@
 #![cfg_attr(feature = "nightly", feature(const_fn))]
 #![cfg_attr(feature = "docs-rs", feature(allocator_api))]
 
-use std::{
-    alloc::{GlobalAlloc, Layout, System},
-    ops,
-    sync::atomic::{AtomicIsize, AtomicUsize, Ordering},
-};
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::ffi::c_void;
+use std::{mem, ops};
+use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 
 /// An instrumenting middleware which keeps track of allocation, deallocation,
 /// and reallocation requests to the underlying global allocator.
@@ -115,6 +114,18 @@ impl StatsAlloc<System> {
     }
 }
 
+fn to_hex(i: u8) -> u8 {
+    // if i > 15 {
+    //     process::exit(42);
+    // }
+
+    if i < 10 {
+        48 + i
+    } else {
+        (i - 10) + 65
+    }
+}
+
 impl<T: GlobalAlloc> StatsAlloc<T> {
     /// Provides access to an instrumented instance of the given global
     /// allocator.
@@ -128,6 +139,76 @@ impl<T: GlobalAlloc> StatsAlloc<T> {
             bytes_deallocated: AtomicUsize::new(0),
             bytes_reallocated: AtomicIsize::new(0),
             inner,
+        }
+    }
+
+    fn log_op(&self, op: char, ptr: usize, size: usize, details: usize) {
+        let mut buf = [0u8; 100];
+        let psz = mem::size_of::<usize>();
+        let shr = (psz as u32)*8 - 8;
+        let mut index = 0;
+
+        buf[index] = b' ';
+        index += 1;
+
+        buf[index] = op as u8;
+        buf[index+1] = b' ';
+        index += 2;
+
+        let mut counter = 8;
+        let c = ptr;
+        loop {
+            if counter == 0 {
+                break;
+            }
+
+            let current = ((c.overflowing_shl(64 - 8*counter as u32).0).overflowing_shr(shr).0) as u8;
+            buf[index] = to_hex(current >> 4);
+            buf[index+1] = to_hex( (current << 4) >> 4);
+
+            counter -= 1;
+            index += 2;
+        }
+
+        buf[index] = b' ';
+        index += 1;
+
+        counter = 8;
+        loop {
+            if counter == 0 {
+                break;
+            }
+
+            let current = ((details.overflowing_shl(64 - 8*counter as u32).0).overflowing_shr(shr).0) as u8;
+            buf[index] = to_hex(current >> 4);
+            buf[index+1] = to_hex( (current << 4) >> 4);
+
+            counter -= 1;
+            index += 2;
+        }
+
+        buf[index] = b' ';
+        index += 1;
+
+        counter = 8;
+        loop {
+            if counter == 0 {
+                break;
+            }
+
+            let current = ((size.overflowing_shl(64 - 8*counter as u32).0).overflowing_shr(shr).0) as u8;
+            buf[index] = to_hex(current >> 4);
+            buf[index+1] = to_hex( (current << 4) >> 4);
+
+            counter -= 1;
+            index += 2;
+        }
+        buf[index] = b'\n';
+
+        unsafe {
+            libc::write(1,
+                        buf.as_ptr() as *const c_void,
+                        index+1);
         }
     }
 
@@ -252,19 +333,36 @@ unsafe impl<T: GlobalAlloc> GlobalAlloc for StatsAlloc<T> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         self.allocations.fetch_add(1, Ordering::SeqCst);
         self.bytes_allocated.fetch_add(layout.size(), Ordering::SeqCst);
-        self.inner.alloc(layout)
+        let mem = self.inner.alloc(layout);
+        {
+            self.log_op(
+                'A', mem as usize, layout.size(), layout.align()
+            );
+        }
+        mem
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         self.deallocations.fetch_add(1, Ordering::SeqCst);
         self.bytes_deallocated.fetch_add(layout.size(), Ordering::SeqCst);
+        {
+            self.log_op(
+                'D', ptr as usize, layout.size(), layout.align()
+            );
+        }
         self.inner.dealloc(ptr, layout)
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         self.allocations.fetch_add(1, Ordering::SeqCst);
         self.bytes_allocated.fetch_add(layout.size(), Ordering::SeqCst);
-        self.inner.alloc_zeroed(layout)
+        let mem = self.inner.alloc_zeroed(layout);
+        {
+            self.log_op(
+                'Z', mem as usize, layout.size(), layout.align()
+            );
+        }
+        mem
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
@@ -278,6 +376,12 @@ unsafe impl<T: GlobalAlloc> GlobalAlloc for StatsAlloc<T> {
         }
         self.bytes_reallocated
             .fetch_add(new_size.wrapping_sub(layout.size()) as isize, Ordering::SeqCst);
-        self.inner.realloc(ptr, layout, new_size)
+        let mem = self.inner.realloc(ptr, layout, new_size);
+        {
+            self.log_op(
+                'R', mem as usize, layout.size(), new_size,
+            );
+        }
+        mem
     }
 }
